@@ -21,20 +21,31 @@ Embedded users may set `endpoint.Config.PostgreSQL` (or
   password-free and do not mutate shared maps or TLS state in callbacks.
 * `SkipCreateDatabase` disables administrative connections, catalog checks, and
   database creation for databases provisioned separately.
-* `SchemaLockKey` enables a transaction-scoped PostgreSQL advisory lock across
-  schema setup, enabled migrations, and `Backend.Start`, including initial
-  compaction and health-key setup. Every initializer must use the same key.
-  The lock uses a dedicated connection, so the pool must permit at least two
-  open connections. A limit of one is rejected.
+* `SchemaLockKey` enables a transaction-scoped PostgreSQL advisory lock for
+  schema setup, enabled migrations, and compact-revision initialization.
+  All of these operations use the **same transaction and connection** as the
+  lock, and commit before `Backend.Start`. Every initializer must use the same
+  key. Connection loss rolls back the initialization; it cannot leave an
+  unfenced initializer executing DDL on another pooled connection.
 
-The lock coordinates initialization; it does not make schema changes atomic.
-Setup and backend startup use ordinary pooled connections so they can see
-committed DDL. An interrupted initializer may leave partial idempotent setup
-for the next initializer to finish. Lock acquisition and commit failures fail
-startup without an unlocked fallback or automatic replay. Cancel a failed
-backend's context before retrying. Do not hold the same advisory lock around
-`endpoint.Listen`, which would self-deadlock. Verify advisory-lock support and
-concurrent initialization against the target PostgreSQL-compatible service.
+The existing one-open-connection guard remains: ordinary backend startup
+still needs at least two pooled connections, independently of schema setup.
+
+The ordinary backend sees one committed compact-revision row, so its startup
+does not need to insert or repair that row. Health-key creation remains
+independently idempotent through the unique `(name, prev_revision)` index.
+There is no startup gap-fill helper in this version; runtime gap filling is
+unchanged. The schema lock does not fence normal runtime writes or replace
+cluster compatibility checks.
+
+Lock acquisition and commit failures fail startup without an unlocked fallback
+or automatic replay. PostgreSQL sequence increments are not transactional and
+may leave gaps after an aborted attempt. Cancel a failed backend's context
+before retrying. Do not hold the same advisory lock around `endpoint.Listen`,
+which would self-deadlock. The target PostgreSQL-compatible service must support
+transactional DDL and transaction advisory locks. An opt-in integration test
+uses `KINE_PG_TEST_DSN` for a disposable local PostgreSQL instance; it creates
+isolated schemas and terminates only a test-owned backend connection.
 
 Nil PostgreSQL settings retain DSN parsing and database-creation behavior.
 Connector authentication and callback errors are replaced by a fixed error to

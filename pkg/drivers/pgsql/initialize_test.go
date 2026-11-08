@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,8 @@ type lockConnector struct {
 	commits    atomic.Int32
 	rollbacks  atomic.Int32
 	failLock   bool
+	failSetup  bool
+	failCommit bool
 	allowSetup bool
 	setupCalls atomic.Int32
 }
@@ -34,10 +37,39 @@ func (c *lockConnector) Driver() driver.Driver                        { return n
 func (c *lockConn) Prepare(string) (driver.Stmt, error)               { return nil, errors.New("unexpected prepare") }
 func (c *lockConn) Close() error                                      { return nil }
 func (c *lockConn) Begin() (driver.Tx, error)                         { return &lockTx{c}, nil }
+func (c *lockConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return c.Begin()
+}
+
+type startupRows struct {
+	version bool
+	sent    bool
+}
+
+func (r *startupRows) Columns() []string { return []string{"value"} }
+func (r *startupRows) Close() error      { return nil }
+func (r *startupRows) Next(values []driver.Value) error {
+	if !r.version || r.sent {
+		return io.EOF
+	}
+	r.sent = true
+	values[0] = "PostgreSQL"
+	return nil
+}
+
+func (c *lockConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+	if !c.held {
+		return nil, errors.New("startup query did not use the lock connection")
+	}
+	return &startupRows{version: query == "select version()"}, nil
+}
 func (c *lockConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if c.c.allowSetup && query != "SELECT pg_advisory_xact_lock($1)" {
-		if len(c.c.gate) != 1 {
-			return nil, errors.New("schema setup ran outside lock")
+		if c.c.failSetup {
+			return nil, errors.New("schema setup failed")
+		}
+		if !c.held {
+			return nil, errors.New("schema setup did not use the lock connection")
 		}
 		c.c.setupCalls.Add(1)
 		return driver.RowsAffected(1), nil
@@ -62,7 +94,14 @@ func (t *lockTx) release() {
 		t.conn.held = false
 	}
 }
-func (t *lockTx) Commit() error   { t.conn.c.commits.Add(1); t.release(); return nil }
+func (t *lockTx) Commit() error {
+	t.conn.c.commits.Add(1)
+	t.release()
+	if t.conn.c.failCommit {
+		return errors.New("commit failed")
+	}
+	return nil
+}
 func (t *lockTx) Rollback() error { t.conn.c.rollbacks.Add(1); t.release(); return nil }
 
 func TestSchemaLockRelease(t *testing.T) {
@@ -72,7 +111,7 @@ func TestSchemaLockRelease(t *testing.T) {
 			db := sql.OpenDB(c)
 			defer db.Close()
 			called := false
-			err := withSchemaLock(context.Background(), db, 123, func() error {
+			err := withSchemaLock(context.Background(), db, 123, func(_ *sql.Tx) error {
 				called = true
 				if len(c.gate) != 1 {
 					t.Fatal("initializer ran outside lock")
@@ -111,7 +150,7 @@ func TestSchemaLockSerializesInitializersAndRetries(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := withSchemaLock(ctx, db, 123, func() error {
+			if err := withSchemaLock(ctx, db, 123, func(_ *sql.Tx) error {
 				if active.Add(1) != 1 {
 					t.Error("concurrent initializers")
 				}
@@ -128,8 +167,8 @@ func TestSchemaLockSerializesInitializersAndRetries(t *testing.T) {
 		t.Fatal("not all initializers completed")
 	}
 	// An interrupted attempt must not prevent a later initializer from running.
-	_ = withSchemaLock(ctx, db, 123, func() error { return errors.New("interrupted") })
-	if err := withSchemaLock(ctx, db, 123, func() error { return nil }); err != nil {
+	_ = withSchemaLock(ctx, db, 123, func(_ *sql.Tx) error { return errors.New("interrupted") })
+	if err := withSchemaLock(ctx, db, 123, func(_ *sql.Tx) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if db.Stats().InUse != 0 {
@@ -144,7 +183,7 @@ func TestSchemaLockWaitIsCancelable(t *testing.T) {
 	defer db.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	err := withSchemaLock(ctx, db, 123, func() error { t.Error("initializer ran without acquiring lock"); return nil })
+	err := withSchemaLock(ctx, db, 123, func(_ *sql.Tx) error { t.Error("initializer ran without acquiring lock"); return nil })
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("lock wait error = %v", err)
 	}
@@ -157,21 +196,21 @@ type startupBackend struct {
 
 func (b startupBackend) Start(ctx context.Context) error { return b.start(ctx) }
 
-func TestInitializingBackendHoldsLockThroughStart(t *testing.T) {
+func TestInitializingBackendCommitsBeforeStart(t *testing.T) {
 	for _, failStart := range []bool{false, true} {
 		t.Run(map[bool]string{false: "success", true: "backend failure"}[failStart], func(t *testing.T) {
 			c := &lockConnector{gate: make(chan struct{}, 1), allowSetup: true}
 			db := sql.OpenDB(c)
 			defer db.Close()
-			db.SetMaxOpenConns(2)
+			db.SetMaxOpenConns(1)
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			startErr := errors.New("backend startup failed")
 			called := false
 			b := &initializingBackend{db: db, key: 123, Backend: startupBackend{start: func(got context.Context) error {
 				called = true
-				if got != ctx || len(c.gate) != 1 || c.setupCalls.Load() == 0 {
-					t.Error("backend startup must follow schema setup while holding the lock")
+				if got != ctx || len(c.gate) != 0 || c.setupCalls.Load() == 0 || c.commits.Load() != 1 {
+					t.Error("backend startup must follow committed transactional initialization")
 				}
 				if failStart {
 					return startErr
@@ -185,8 +224,32 @@ func TestInitializingBackendHoldsLockThroughStart(t *testing.T) {
 			if len(c.gate) != 0 || db.Stats().InUse != 0 {
 				t.Fatal("startup retained the lock or its connection")
 			}
-			if (!failStart && c.commits.Load() != 1) || (failStart && c.rollbacks.Load() != 1) {
-				t.Fatal("lock transaction did not finish with backend startup")
+			if c.commits.Load() != 1 || c.rollbacks.Load() != 0 {
+				t.Fatal("backend startup must not replay or roll back committed initialization")
+			}
+		})
+	}
+}
+
+func TestInitializingBackendDoesNotStartAfterTransactionFailure(t *testing.T) {
+	for _, mode := range []string{"lock", "setup", "commit"} {
+		t.Run(mode, func(t *testing.T) {
+			c := &lockConnector{
+				gate: make(chan struct{}, 1), allowSetup: true,
+				failLock: mode == "lock", failSetup: mode == "setup", failCommit: mode == "commit",
+			}
+			db := sql.OpenDB(c)
+			defer db.Close()
+			called := false
+			b := &initializingBackend{db: db, key: 123, Backend: startupBackend{start: func(context.Context) error {
+				called = true
+				return nil
+			}}}
+			if err := b.Start(context.Background()); err == nil || called {
+				t.Fatalf("transaction failure must stop startup: called=%v, err=%v", called, err)
+			}
+			if len(c.gate) != 0 || db.Stats().InUse != 0 {
+				t.Fatal("failed initialization retained its lock or connection")
 			}
 		})
 	}

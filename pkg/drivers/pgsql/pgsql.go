@@ -92,8 +92,11 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 	var options []stdlib.OptionOpenDB
 	if cfg.PostgreSQL != nil {
 		options = append(options, cfg.PostgreSQL.Options...)
+		// Backend startup still uses pooled inserts while its SQL transaction
+		// is open. Keep the existing guard even though schema setup itself now
+		// needs only the lock transaction connection.
 		if cfg.PostgreSQL.SchemaLockKey != nil && cfg.ConnectionPoolConfig.MaxOpen == 1 {
-			return false, nil, fmt.Errorf("PostgreSQL schema coordination requires at least two open connections")
+			return false, nil, fmt.Errorf("PostgreSQL backend startup requires at least two open connections")
 		}
 	}
 	connector := newConnector(config, options...)
@@ -184,11 +187,19 @@ func connectionConfig(cfg *drivers.Config) (*pgx.ConnConfig, error) {
 	return prepareConfig(cfg.DataSourceName, cfg.BackendTLSConfig)
 }
 
-func setup(ctx context.Context, db *sql.DB) error {
+type schemaDB interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func setup(ctx context.Context, db schemaDB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")
 	var version string
 	collationSupported := true
-	if err := db.QueryRowContext(ctx, "select version()").Scan(&version); err == nil && strings.Contains(strings.ToLower(version), "cockroachdb") {
+	if err := db.QueryRowContext(ctx, "select version()").Scan(&version); err != nil {
+		return err
+	}
+	if strings.Contains(strings.ToLower(version), "cockroachdb") {
 		// CockroadDB does not seem to support "C" as a collation
 		// It looks like it's using golang.org/x/text/language and ends up calling something like v, err := language.Parse("C")
 		// which parses it as a BCP47 language tag instead of a collation.

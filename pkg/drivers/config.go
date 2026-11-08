@@ -40,9 +40,9 @@ type PostgreSQLConfig struct {
 	Options []stdlib.OptionOpenDB
 	// SkipCreateDatabase avoids all connections to the administrative database.
 	SkipCreateDatabase bool
-	// SchemaLockKey enables pg_advisory_xact_lock on a dedicated connection
-	// across schema/migrations and Backend.Start (compact revision setup).
-	// All initializers must use the same key; the pool must allow >=2 opens.
+	// SchemaLockKey enables pg_advisory_xact_lock on the same transaction as
+	// schema/migrations and compact revision setup, committed before Backend.Start.
+	// All initializers must use the same key.
 	SchemaLockKey *int64
 }
 
