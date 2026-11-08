@@ -3,7 +3,6 @@ package pgsql
 import (
 	"context"
 	"database/sql"
-	"database/sql/driver"
 	"fmt"
 	"net/url"
 	"os"
@@ -85,14 +84,23 @@ var (
 )
 
 func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, server.Backend, error) {
-	config, err := prepareConfig(cfg.DataSourceName, cfg.BackendTLSConfig)
+	config, err := connectionConfig(cfg)
 	if err != nil {
 		return false, nil, err
 	}
 
-	connector := stdlib.GetConnector(*config)
-	if err := createDBIfNotExist(ctx, config, connector); err != nil {
-		return false, nil, err
+	var options []stdlib.OptionOpenDB
+	if cfg.PostgreSQL != nil {
+		options = append(options, cfg.PostgreSQL.Options...)
+		if cfg.PostgreSQL.SchemaLockKey != nil && cfg.ConnectionPoolConfig.MaxOpen == 1 {
+			return false, nil, fmt.Errorf("PostgreSQL schema coordination requires at least two open connections")
+		}
+	}
+	connector := newConnector(config, options...)
+	if cfg.PostgreSQL == nil || !cfg.PostgreSQL.SkipCreateDatabase {
+		if err := createDBIfNotExist(ctx, config, options...); err != nil {
+			return false, nil, err
+		}
 	}
 
 	dialect, err := generic.OpenDB(ctx, wg, "pgx", connector, cfg.ConnectionPoolConfig, "$", true, cfg.MetricsRegisterer)
@@ -145,7 +153,7 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		if err, ok := err.(*pgconn.PgError); ok {
 			return err.Code
 		}
-		return err.Error()
+		return "unknown"
 	}
 	dialect.TranslateStartKeyFunc = func(startKey string) string {
 		// replace trailing null with 0x1a (substitute) as postgres does not allow null byte in UTF8 strings
@@ -154,18 +162,33 @@ func New(ctx context.Context, wg *sync.WaitGroup, cfg *drivers.Config) (bool, se
 		}
 		return startKey
 	}
-	if err := setup(dialect.DB); err != nil {
+	backend := logstructured.New(sqllog.New(dialect, wg, cfg))
+	if cfg.PostgreSQL != nil && cfg.PostgreSQL.SchemaLockKey != nil {
+		return true, &initializingBackend{
+			Backend: backend,
+			db:      dialect.DB,
+			key:     *cfg.PostgreSQL.SchemaLockKey,
+		}, nil
+	}
+	if err := setup(ctx, dialect.DB); err != nil {
 		return false, nil, err
 	}
 
-	return true, logstructured.New(sqllog.New(dialect, wg, cfg)), nil
+	return true, backend, nil
 }
 
-func setup(db *sql.DB) error {
+func connectionConfig(cfg *drivers.Config) (*pgx.ConnConfig, error) {
+	if cfg.PostgreSQL != nil && cfg.PostgreSQL.ConnConfig != nil {
+		return cfg.PostgreSQL.ConnConfig.Copy(), nil
+	}
+	return prepareConfig(cfg.DataSourceName, cfg.BackendTLSConfig)
+}
+
+func setup(ctx context.Context, db *sql.DB) error {
 	logrus.Infof("Configuring database table schema and indexes, this may take a moment...")
 	var version string
 	collationSupported := true
-	if err := db.QueryRow("select version()").Scan(&version); err == nil && strings.Contains(strings.ToLower(version), "cockroachdb") {
+	if err := db.QueryRowContext(ctx, "select version()").Scan(&version); err == nil && strings.Contains(strings.ToLower(version), "cockroachdb") {
 		// CockroadDB does not seem to support "C" as a collation
 		// It looks like it's using golang.org/x/text/language and ends up calling something like v, err := language.Parse("C")
 		// which parses it as a BCP47 language tag instead of a collation.
@@ -177,7 +200,7 @@ func setup(db *sql.DB) error {
 			stmt = strings.ReplaceAll(stmt, ` COLLATE "C"`, "")
 		}
 		logrus.Tracef("SETUP EXEC : %v", query.Strip(stmt))
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
@@ -197,7 +220,7 @@ func setup(db *sql.DB) error {
 			continue
 		}
 		logrus.Tracef("SETUP EXEC MIGRATION %d: %v", i, query.Strip(stmt))
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
@@ -206,13 +229,13 @@ func setup(db *sql.DB) error {
 	return nil
 }
 
-func createDBIfNotExist(ctx context.Context, config *pgx.ConnConfig, connector driver.Connector) error {
+func createDBIfNotExist(ctx context.Context, config *pgx.ConnConfig, options ...stdlib.OptionOpenDB) error {
 	createConfig := config.Copy()
 	createConfig.Database = "postgres"
-	connector = stdlib.GetConnector(*createConfig)
+	connector := newConnector(createConfig, options...)
 	conn, err := connector.Connect(ctx)
 	if err != nil {
-		logrus.Warnf("failed to ensure existence of database %s: unable to connect to default postgres database: %v", createConfig.Database, err)
+		logrus.Warn("failed to ensure existence of database: unable to connect to default postgres database")
 		return nil
 	}
 	conn.Close()
@@ -221,16 +244,16 @@ func createDBIfNotExist(ctx context.Context, config *pgx.ConnConfig, connector d
 	defer db.Close()
 
 	var exists bool
-	err = db.QueryRow("SELECT 1 FROM pg_database WHERE datname = $1", config.Database).Scan(&exists)
+	err = db.QueryRowContext(ctx, "SELECT 1 FROM pg_database WHERE datname = $1", config.Database).Scan(&exists)
 	if err != nil && err != sql.ErrNoRows {
-		logrus.Warnf("failed to check existence of database %s, going to attempt create: %v", config.Database, err)
+		logrus.Warn("failed to check existence of database, going to attempt create")
 	}
 
 	if !exists {
 		stmt := fmt.Sprintf(createDB, config.Database)
 		logrus.Tracef("SETUP EXEC : %v", query.Strip(stmt))
-		if _, err = db.Exec(stmt); err != nil {
-			logrus.Warnf("failed to create database %s: %v", config.Database, err)
+		if _, err = db.ExecContext(ctx, stmt); err != nil {
+			logrus.Warn("failed to create database")
 		} else {
 			logrus.Tracef("created database: %s", config.Database)
 		}

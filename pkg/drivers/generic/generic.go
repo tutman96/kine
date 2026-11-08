@@ -132,11 +132,11 @@ func configureConnectionPooling(connPoolConfig ConnectionPoolConfig, db *sql.DB,
 	db.SetConnMaxIdleTime(connPoolConfig.MaxIdleTime)
 }
 
-func openAndTest(connector driver.Connector) (*sql.DB, error) {
+func openAndTest(ctx context.Context, connector driver.Connector) (*sql.DB, error) {
 	db := sql.OpenDB(connector)
 
 	for i := 0; i < 3; i++ {
-		if err := db.Ping(); err != nil {
+		if err := db.PingContext(ctx); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -152,12 +152,12 @@ func OpenDB(ctx context.Context, wg *sync.WaitGroup, driverName string, connecto
 	)
 
 	for range 300 {
-		db, err = openAndTest(connector)
+		db, err = openAndTest(ctx, connector)
 		if err == nil {
 			break
 		}
 
-		logrus.Errorf("Failed to ping database connection: %v", err)
+		logrus.Error("Failed to ping database connection")
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -297,6 +297,7 @@ func (d *Generic) prepare(ctx context.Context, sql *query.Named) (*query.Stmt, e
 	}
 	stmt, err := conn.PrepareContext(ctx, sql.Query)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	return &query.Stmt{Named: sql, Conn: conn, Stmt: stmt}, nil

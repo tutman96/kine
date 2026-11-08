@@ -57,6 +57,7 @@ type Config struct {
 	LogFormat             string
 	PeerConfig            drivers.PeerConfig
 	S3Config              drivers.S3Config
+	PostgreSQL            *drivers.PostgreSQLConfig
 }
 
 type ETCDConfig struct {
@@ -68,6 +69,10 @@ type ETCDConfig struct {
 func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 	wg := waitGroup(config)
 	bctx, bcancel := context.WithCancel(context.Background())
+	// Preserve the backend's graceful-shutdown lifetime, but allow caller
+	// cancellation to interrupt connection retries and schema locks at startup.
+	stopStartupCancel := context.AfterFunc(ctx, bcancel)
+	defer stopStartupCancel()
 	defer func() {
 		if rerr != nil {
 			bcancel()
@@ -88,6 +93,7 @@ func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 		PollInterval:          config.PollInterval,
 		PeerConfig:            config.PeerConfig,
 		S3Config:              config.S3Config,
+		PostgreSQL:            config.PostgreSQL,
 	})
 
 	if err != nil {

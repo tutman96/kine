@@ -499,7 +499,9 @@ func RowsToEvents(rows *sql.Rows, val, prev bool) (server.EventBatch, int64, err
 			batch.Events = append(batch.Events, event)
 		}
 	}
-	return batch, compact, nil
+	// Errors may arrive after QueryContext succeeds, including a forced
+	// disconnect while streaming. Never publish a partially read batch.
+	return batch, compact, rows.Err()
 }
 
 func (s *SQLLog) Watch(ctx context.Context) <-chan server.EventBatch {
@@ -577,6 +579,7 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 			stmt, err = s.d.PrepareAfter(s.ctx, s.pollBatchSize)
 			if err != nil {
 				logrus.Errorf("Failed to prepare to list latest changes: %v", err)
+				waitForMore = true
 			}
 			continue
 		}
@@ -590,6 +593,7 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 				stmt.Close()
 				stmt = nil
 			}
+			waitForMore = true
 			continue
 		}
 
@@ -597,6 +601,9 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 		waitForMore = int64(len(batch.Events)) < s.pollBatchSize
 		if err != nil {
 			logrus.Errorf("Failed to convert rows to events: %v", err)
+			stmt.Close()
+			stmt = nil
+			waitForMore = true
 			continue
 		}
 
@@ -683,7 +690,11 @@ func (s *SQLLog) poll(result chan server.EventBatch, pollStart int64) {
 			s.currentRev.CompareAndSwap(pollRevision, rev)
 			pollRevision = rev
 			if len(sequential) > 0 {
-				result <- server.EventBatch{CurrentRev: pollRevision, Events: sequential}
+				select {
+				case result <- server.EventBatch{CurrentRev: pollRevision, Events: sequential}:
+				case <-s.ctx.Done():
+					return
+				}
 			}
 		}
 	}

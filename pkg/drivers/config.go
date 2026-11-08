@@ -3,6 +3,8 @@ package drivers
 import (
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/k3s-io/kine/pkg/drivers/generic"
 	"github.com/k3s-io/kine/pkg/tls"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,6 +26,24 @@ type Config struct {
 	PollBatchSize         int64
 	PeerConfig            PeerConfig
 	S3Config              S3Config
+	PostgreSQL            *PostgreSQLConfig
+}
+
+// PostgreSQLConfig contains optional settings for embedded PostgreSQL users.
+// Nil preserves upstream DSN parsing and database creation behavior.
+type PostgreSQLConfig struct {
+	// ConnConfig, when non-nil, replaces DSN/TLS parsing. It must have been
+	// created by pgx.ParseConfig. Kine copies it before constructing connectors.
+	ConnConfig *pgx.ConnConfig
+	// Options apply to EVERY connector, including database creation. Use
+	// stdlib.OptionBeforeConnect for fresh per-physical-connection credentials.
+	Options []stdlib.OptionOpenDB
+	// SkipCreateDatabase avoids all connections to the administrative database.
+	SkipCreateDatabase bool
+	// SchemaLockKey enables pg_advisory_xact_lock on a dedicated connection
+	// across schema/migrations and Backend.Start (compact revision setup).
+	// All initializers must use the same key; the pool must allow >=2 opens.
+	SchemaLockKey *int64
 }
 
 // PeerConfig and S3Config carry kine-server-shaped settings consumed by the
