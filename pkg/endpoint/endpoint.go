@@ -69,8 +69,10 @@ type ETCDConfig struct {
 func Listen(ctx context.Context, config Config) (etcd ETCDConfig, rerr error) {
 	wg := waitGroup(config)
 	bctx, bcancel := context.WithCancel(context.Background())
-	// Preserve the backend's graceful-shutdown lifetime, but allow caller
-	// cancellation to interrupt connection retries and schema locks at startup.
+	// Do not derive bctx directly from ctx: after startup, in-flight GRPC work
+	// must finish before the backend is canceled. Bridge caller cancellation
+	// before drivers.New so connection retries and schema-lock waits are still
+	// interruptible, then detach this bridge when synchronous startup returns.
 	stopStartupCancel := context.AfterFunc(ctx, bcancel)
 	defer stopStartupCancel()
 	defer func() {
