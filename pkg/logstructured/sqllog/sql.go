@@ -64,7 +64,7 @@ func (s *SQLLog) Start(ctx context.Context) error {
 	return s.compactStart(s.ctx)
 }
 
-func (s *SQLLog) compactStart(ctx context.Context) error {
+func (s *SQLLog) compactStart(ctx context.Context) (err error) {
 	logrus.Tracef("COMPACTSTART")
 
 	rows, err := s.d.After(ctx, "compact_rev_key", "", 0, 0)
@@ -96,7 +96,7 @@ func (s *SQLLog) compactStart(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer t.MustRollback()
+	defer rollback(t, &err)
 
 	// this is to work around a bug in which we ended up with two compact_rev_key rows
 	maxRev := int64(0)
@@ -140,11 +140,12 @@ func (s *SQLLog) compactor(interval time.Duration) {
 			return
 		case <-t.C:
 		}
-		compactRev, targetCompactRev = s.compactIter(compactRev, targetCompactRev)
+		// compactIter reports failures through logging and metrics; retry on the next tick.
+		compactRev, targetCompactRev, _ = s.compactIter(compactRev, targetCompactRev)
 	}
 }
 
-func (s *SQLLog) compactIter(compactRev, targetCompactRev int64) (int64, int64) {
+func (s *SQLLog) compactIter(compactRev, targetCompactRev int64) (int64, int64, error) {
 	logrus.Tracef("COMPACT running compactRev=%d targetCompactRev=%d", compactRev, targetCompactRev)
 	// Break up the compaction into smaller batches to avoid locking the database with excessively
 	// long transactions. When things are working normally deletes should proceed quite quickly, but if
@@ -217,7 +218,7 @@ func (s *SQLLog) compactIter(compactRev, targetCompactRev int64) (int64, int64) 
 	}
 	metrics.CompactTotal.WithLabelValues(resultLabel).Inc()
 
-	return compactRev, targetCompactRev
+	return compactRev, targetCompactRev, err
 }
 
 // compactRetry calls compact, and starts over with a new transaction if the dialect reports the error as retriable.
@@ -247,7 +248,7 @@ func (s *SQLLog) compactRetry(compactRev int64, targetCompactRev int64) (compact
 // On any other error, the returned compact and current revisions should not be used.
 //
 // This logic is cribbed from k8s.io/apiserver/pkg/storage/etcd3/compact.go
-func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64, error) {
+func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (compacted, current int64, err error) {
 	ctx, cancel := context.WithTimeout(s.ctx, s.compactTimeout)
 	defer cancel()
 
@@ -255,7 +256,12 @@ func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer t.MustRollback()
+	defer func() {
+		rollback(t, &err)
+		if err != nil && err != server.ErrCompacted {
+			compacted, current = 0, 0
+		}
+	}()
 
 	currentRev, err := t.CurrentRevision(ctx)
 	if err != nil {
@@ -302,10 +308,20 @@ func (s *SQLLog) compact(compactRev int64, targetCompactRev int64) (int64, int64
 
 	// Commit the transaction if we make it all the way through deleting without any
 	// errors. The deferred rollback becomes a no-op if the transaction is committed.
-	t.MustCommit()
+	if err := t.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("failed to commit compaction transaction: %w", err)
+	}
 	logrus.Infof("COMPACT deleted %d rows from %d revisions in %s - compacted to %d/%d", deletedRows, (targetCompactRev - compactRev), time.Since(start), targetCompactRev, currentRev)
 
 	return targetCompactRev, currentRev, nil
+}
+
+// rollback releases unfinished transactions without losing the operation's error.
+// database/sql returns ErrTxDone after either Commit or a previous Rollback.
+func rollback(t server.Transaction, err *error) {
+	if rerr := t.Rollback(); rerr != nil && !errors.Is(rerr, sql.ErrTxDone) {
+		*err = errors.Join(*err, fmt.Errorf("failed to roll back transaction: %w", rerr))
+	}
 }
 
 // postCompact executes any driver-specific cleanup after a successful compaction pass.
@@ -884,17 +900,25 @@ func (s *SQLLog) DbSize(ctx context.Context) (int64, error) {
 }
 
 func (s *SQLLog) Compact(ctx context.Context, targetCompactRev int64) (int64, error) {
-	currentRev, _ := s.CurrentRevision(ctx)
+	currentRev, err := s.CurrentRevision(ctx)
+	if err != nil {
+		return 0, err
+	}
 	if targetCompactRev > currentRev {
 		return 0, server.ErrFutureRev
 	}
-	compactRev, _ := s.CompactRevision(s.ctx)
+	compactRev, err := s.CompactRevision(ctx)
+	if err != nil {
+		return 0, err
+	}
 	if targetCompactRev <= compactRev {
 		return 0, server.ErrCompacted
 	}
 	// manual compact is a no-op unless automatic compaction is disabled
 	if s.compactInterval <= 0 {
-		s.compactIter(compactRev, targetCompactRev)
+		if _, _, err := s.compactIter(compactRev, targetCompactRev); err != nil {
+			return 0, err
+		}
 		return s.CurrentRevision(ctx)
 	}
 	return currentRev, nil
